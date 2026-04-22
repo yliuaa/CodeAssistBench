@@ -21,10 +21,16 @@ class DockerValidationError(CABEvaluationError):
 class LLMError(CABEvaluationError):
     """Exception raised when LLM operations fail."""
     
-    def __init__(self, message: str, model_name: str = None, retry_count: int = 0):
+    def __init__(
+        self,
+        message: str,
+        model_name: str = None,
+        retry_count: int = 0,
+        error_code: str = "LLM_ERROR",
+    ):
         self.model_name = model_name
         self.retry_count = retry_count
-        super().__init__(message, "LLM_ERROR")
+        super().__init__(message, error_code)
 
 
 class InputTooLongError(LLMError):

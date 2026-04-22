@@ -110,7 +110,7 @@ class CABConfig:
         self.models = {
             "haiku": ModelConfig(
                 name="haiku",
-                model_id="us.anthropic.claude-3-5-haiku-20241022-v1:0",
+                model_id="us.anthropic.claude-haiku-4-5-20251001-v1:0",
                 max_tokens=120000,
                 provider="bedrock"
             ),

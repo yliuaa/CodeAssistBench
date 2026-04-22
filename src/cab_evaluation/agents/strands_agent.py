@@ -86,12 +86,26 @@ class StrandsAgent(BaseAgent):
         Returns:
             Strands model ID
         """
+        # Prefer configured model IDs so CABConfig aliases like qwen32b stay in sync
+        # with the actual model definitions.
+        try:
+            model_config = self.config.get_model_config(model_name)
+            if model_config.provider == "bedrock":
+                return model_config.model_id
+        except Exception:
+            pass
+
+        # Allow callers to pass a full Bedrock model ID directly.
+        if "." in model_name and ":" in model_name:
+            return model_name
+
         # Model mapping from CAB to Strands/Bedrock
         model_mapping = {
-            "haiku": "us.anthropic.claude-3-5-haiku-20241022-v1:0",
+            "haiku": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
             "sonnet": "us.anthropic.claude-3-7-sonnet-20250219-v1:0", 
             "sonnet37": "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
             "thinking": "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
+            "qwen32b": "qwen.qwen3-32b-v1:0",
             "deepseek": "us.deepseek.r1-v1:0",
             "llama": "us.meta.llama3-3-70b-instruct-v1:0",
             # Default fallback to sonnet37 equivalent
@@ -124,16 +138,28 @@ class StrandsAgent(BaseAgent):
         
         # Get model ID for this model
         model_id = self._get_strands_model_id(self.model_name)
-        
-        # Create Bedrock model with caching enabled and temperature=0 for determinism
-        model = BedrockModel(
-            model_id=model_id,
-            region_name="us-west-2",
-            max_retries=1000,
-            cache_prompt="default",  # Cache system prompt
-            cache_tools="default",   # Cache tools
-            temperature=0.0          # Set to 0 for deterministic outputs
-        )
+
+        model_kwargs = {
+            "model_id": model_id,
+            "region_name": "us-west-2",
+            "max_retries": 1000,
+            "temperature": 0.0,
+        }
+
+        if not self._supports_streaming_tool_use(model_id):
+            model_kwargs["streaming"] = False
+            self.logger.info(f"Streaming disabled for model {model_id}")
+
+        # Bedrock explicit prompt caching is only supported by a subset of models.
+        # CAB previously enabled it unconditionally, which breaks models like Qwen.
+        if self._supports_prompt_caching(model_id):
+            model_kwargs["cache_prompt"] = "default"
+            model_kwargs["cache_tools"] = "default"
+        else:
+            self.logger.info(f"Prompt caching disabled for model {model_id}")
+
+        # Create Bedrock model with deterministic temperature.
+        model = BedrockModel(**model_kwargs)
         
         # Select tools based on read-only mode
         if self.read_only:
@@ -158,6 +184,37 @@ class StrandsAgent(BaseAgent):
         
         self.logger.info(f"Strands agent created with model {model_id}")
         return strands_agent
+
+    def _supports_prompt_caching(self, model_id: str) -> bool:
+        """Return whether the model supports the explicit caching config used here."""
+        normalized = model_id.removeprefix("us.").removeprefix("eu.").removeprefix("global.")
+        supported_models = {
+            "anthropic.claude-opus-4-5-20251101-v1:0",
+            "anthropic.claude-opus-4-1-20250805-v1:0",
+            "anthropic.claude-opus-4-20250514-v1:0",
+            "anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "anthropic.claude-haiku-4-5-20251001-v1:0",
+            "anthropic.claude-sonnet-4-20250514-v1:0",
+            "anthropic.claude-3-7-sonnet-20250219-v1:0",
+            "anthropic.claude-3-5-haiku-20241022-v1:0",
+            "anthropic.claude-3-5-sonnet-20241022-v2:0",
+            "amazon.nova-micro-v1:0",
+            "amazon.nova-lite-v1:0",
+            "amazon.nova-pro-v1:0",
+            "amazon.nova-premier-v1:0",
+            "amazon.nova-2-lite-v1:0",
+        }
+        return normalized in supported_models
+
+    def _supports_streaming_tool_use(self, model_id: str) -> bool:
+        """Return whether the model supports streaming together with tool use."""
+        normalized = model_id.removeprefix("us.").removeprefix("eu.").removeprefix("global.")
+
+        unsupported_prefixes = (
+            "deepseek.",
+            "meta.llama",
+        )
+        return not normalized.startswith(unsupported_prefixes)
     
     def get_system_prompt(self, **kwargs) -> str:
         """Get system prompt for this agent type.

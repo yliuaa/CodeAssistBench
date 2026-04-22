@@ -215,7 +215,7 @@ class BaseAgent(ABC):
         """
         # Model mapping from CAB to Strands/Bedrock
         model_mapping = {
-            "haiku": "us.anthropic.claude-3-5-haiku-20241022-v1:0",
+            "haiku": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
             "sonnet": "us.anthropic.claude-3-7-sonnet-20250219-v1:0", 
             "sonnet37": "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
             "thinking": "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
@@ -256,15 +256,23 @@ class BaseAgent(ABC):
         
         # Get model ID for this model
         model_id = self._get_strands_model_id(self.model_name)
-        
-        # Create Bedrock model with caching enabled
-        model = BedrockModel(
-            model_id=model_id,
-            region_name="us-west-2",
-            max_retries=1000,
-            cache_prompt="default",  # Cache system prompt
-            cache_tools="default"    # Cache tools
-        )
+
+        model_kwargs = {
+            "model_id": model_id,
+            "region_name": "us-west-2",
+            "max_retries": 1000,
+        }
+
+        normalized_model_id = model_id.removeprefix("us.").removeprefix("eu.").removeprefix("global.")
+        if normalized_model_id.startswith("anthropic.") or normalized_model_id.startswith("amazon.nova"):
+            model_kwargs["cache_prompt"] = "default"
+            model_kwargs["cache_tools"] = "default"
+
+        if normalized_model_id.startswith("deepseek.") or normalized_model_id.startswith("meta.llama"):
+            model_kwargs["streaming"] = False
+
+        # Create Bedrock model
+        model = BedrockModel(**model_kwargs)
         
         # Select tools based on read-only mode
         if self._read_only:
