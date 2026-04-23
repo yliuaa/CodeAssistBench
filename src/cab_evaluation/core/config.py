@@ -21,6 +21,7 @@ class ModelConfig:
     temperature: float = 0.0
     region: str = "us-east-1"
     provider: str = "bedrock"
+    base_url: Optional[str] = None
     api_key_env_var: Optional[str] = None
     thinking_enabled: bool = False
 
@@ -177,6 +178,20 @@ class CABConfig:
                 max_tokens=32000,
                 provider="openai",
                 api_key_env_var="OPENAI_API_KEY"
+            ),
+            "qwen25_7b_vllm": ModelConfig(
+                name="qwen25_7b_vllm",
+                model_id="Qwen/Qwen2.5-7B-Instruct",
+                max_tokens=32000,
+                provider="vllm",
+                base_url="http://127.0.0.1:8001/v1"
+            ),
+            "qwen3coder_vllm": ModelConfig(
+                name="qwen3coder_vllm",
+                model_id="Qwen/Qwen3-Coder-30B-A3B-Instruct",
+                max_tokens=12000,
+                provider="vllm",
+                base_url="http://127.0.0.1:8000/v1"
             )
         }
     
@@ -308,6 +323,7 @@ class CABConfig:
         
         bedrock_models = 0
         openai_models = 0
+        vllm_models = 0
         
         # Only validate models that will actually be used
         models_to_validate = {
@@ -328,12 +344,18 @@ class CABConfig:
                         errors.append(f"OpenAI model {name} missing api_key_env_var configuration")
             elif model_config.provider == "bedrock":
                 bedrock_models += 1
+            elif model_config.provider == "vllm":
+                vllm_models += 1
+                # API key may be optional for local vLLM servers; only validate if explicitly configured.
+                if name in models_to_validate and model_config.api_key_env_var:
+                    if not os.getenv(model_config.api_key_env_var):
+                        errors.append(f"Missing environment variable {model_config.api_key_env_var} for model {name}")
             else:
                 warnings.append(f"Unknown provider '{model_config.provider}' for model {name}")
         
-        if bedrock_models == 0 and openai_models == 0:
+        if bedrock_models == 0 and openai_models == 0 and vllm_models == 0:
             errors.append("No valid models configured")
-        elif bedrock_models == 0 and openai_models > 0:
+        elif bedrock_models == 0 and openai_models > 0 and vllm_models == 0:
             warnings.append("Only OpenAI models configured - ensure GPT_TOKEN environment variable is set")
         
         for default_model in [self.default_maintainer_model, self.default_user_model, self.default_judge_model]:
@@ -352,7 +374,10 @@ class CABConfig:
         if errors:
             raise ConfigurationError(f"Configuration validation failed: {'; '.join(errors)}")
         
-        logger.info(f"Configuration validation passed - {bedrock_models} Bedrock models, {openai_models} OpenAI models configured")
+        logger.info(
+            f"Configuration validation passed - {bedrock_models} Bedrock models, "
+            f"{openai_models} OpenAI models, {vllm_models} vLLM models configured"
+        )
         if warnings:
             logger.info(f"Configuration warnings: {len(warnings)} warnings logged")
         return True

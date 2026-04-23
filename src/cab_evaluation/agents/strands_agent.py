@@ -65,6 +65,7 @@ class StrandsAgent(BaseAgent):
         
         self._strands_agent = None
         self._strands_tools = None
+        self._strands_system_prompt: Optional[str] = None
         self._setup_strands_environment()
         
     def _setup_strands_environment(self):
@@ -126,7 +127,6 @@ class StrandsAgent(BaseAgent):
         try:
             # Import Strands components
             from strands import Agent
-            from strands.models import BedrockModel
             from strands.hooks import HookProvider, MessageAddedEvent
             
             # Import Strands tools
@@ -138,12 +138,21 @@ class StrandsAgent(BaseAgent):
         
         # Get model ID for this model
         model_id = self._get_strands_model_id(self.model_name)
+        model_config = self.config.get_model_config(self.model_name)
+
+        if model_config.provider != "bedrock":
+            raise AgentError(
+                f"Strands tool backend only supports Bedrock models here; "
+                f"provider '{model_config.provider}' should use LLMService."
+            )
+
+        from strands.models import BedrockModel
 
         model_kwargs = {
             "model_id": model_id,
-            "region_name": "us-west-2",
+            "region_name": model_config.region,
             "max_retries": 1000,
-            "temperature": 0.0,
+            "temperature": model_config.temperature,
         }
 
         if not self._supports_streaming_tool_use(model_id):
@@ -151,14 +160,12 @@ class StrandsAgent(BaseAgent):
             self.logger.info(f"Streaming disabled for model {model_id}")
 
         # Bedrock explicit prompt caching is only supported by a subset of models.
-        # CAB previously enabled it unconditionally, which breaks models like Qwen.
         if self._supports_prompt_caching(model_id):
             model_kwargs["cache_prompt"] = "default"
             model_kwargs["cache_tools"] = "default"
         else:
             self.logger.info(f"Prompt caching disabled for model {model_id}")
 
-        # Create Bedrock model with deterministic temperature.
         model = BedrockModel(**model_kwargs)
         
         # Select tools based on read-only mode
@@ -263,12 +270,18 @@ Be concise but thorough in your explanations."""
         Raises:
             AgentError: If Strands agent execution fails
         """
+        if self.model_config.provider != "bedrock":
+            return await self.call_llm(user_prompt, system_prompt, issue_id, **kwargs)
+
         # Increment counter
         self.increment_call_counter(issue_id)
         
-        # Build Strands agent if not already created or system prompt changed
-        if self._strands_agent is None:
+        # Rebuild Strands agent when first used or when system prompt changes.
+        if self._strands_agent is None or self._strands_system_prompt != system_prompt:
+            if self._strands_agent is not None:
+                self.logger.info("System prompt changed; rebuilding Strands agent instance")
             self._strands_agent = self._build_strands_agent(system_prompt)
+            self._strands_system_prompt = system_prompt
         
         # Log prompts
         self.logger.info(f"===== SYSTEM PROMPT =====\n{system_prompt}\n")
@@ -315,6 +328,10 @@ Be concise but thorough in your explanations."""
     def _log_metrics_summary(self):
         """Log comprehensive metrics from Strands agent."""
         if self._strands_agent is None:
+            return
+
+        if not hasattr(self._strands_agent, "event_loop_metrics"):
+            self.logger.info("Metrics summary not available for current Strands model backend")
             return
         
         try:
@@ -445,6 +462,10 @@ Be concise but thorough in your explanations."""
         """
         if self._strands_agent is None:
             self.logger.warning("No Strands agent available for logging")
+            return ""
+
+        if not hasattr(self._strands_agent, "event_loop_metrics"):
+            self.logger.warning("No event_loop_metrics available; skipping Strands interaction log")
             return ""
         
         os.makedirs(log_dir, exist_ok=True)

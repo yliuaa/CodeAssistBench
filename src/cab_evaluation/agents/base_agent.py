@@ -190,6 +190,60 @@ class BaseAgent(ABC):
             content=content,
             metadata=metadata or {}
         )
+
+    def _truncate_text(self, text: str, max_chars: int, label: str = "content") -> str:
+        """Deterministically truncate long text while preserving head and tail."""
+        if not text or len(text) <= max_chars:
+            return text
+
+        omitted = len(text) - max_chars
+        head_chars = max_chars * 2 // 3
+        tail_chars = max_chars - head_chars
+        return (
+            f"{text[:head_chars]}\n"
+            f"[... omitted {omitted} chars from {label} ...]\n"
+            f"{text[-tail_chars:]}"
+        )
+
+    def _format_bounded_conversation_history(
+        self,
+        history: list[ConversationMessage],
+        max_chars: Optional[int] = None,
+        recent_messages: Optional[int] = None,
+        per_message_chars: Optional[int] = None,
+    ) -> str:
+        """Format conversation history with a fixed, reproducible context budget."""
+        max_chars = max_chars or int(os.getenv("CAB_HISTORY_CONTEXT_CHARS", "12000"))
+        recent_messages = recent_messages or int(os.getenv("CAB_HISTORY_RECENT_MESSAGES", "6"))
+        per_message_chars = per_message_chars or int(os.getenv("CAB_HISTORY_MESSAGE_CHARS", "3000"))
+
+        if not history:
+            return ""
+
+        selected: list[ConversationMessage] = []
+        omitted = 0
+        if len(history) <= recent_messages + 1:
+            selected = list(history)
+        else:
+            selected = [history[0], *history[-recent_messages:]]
+            omitted = len(history) - len(selected)
+
+        parts = []
+        for idx, message in enumerate(selected):
+            role = "User" if message.role == "user" else "Maintainer"
+            content = self._truncate_text(message.content, per_message_chars, f"{role.lower()} message")
+            parts.append(f"{role}: {content}")
+            if idx == 0 and omitted:
+                parts.append(f"[... omitted {omitted} earlier conversation messages ...]")
+
+        formatted = "\n\n".join(parts)
+        while len(formatted) > max_chars and len(parts) > 1:
+            # Drop the oldest non-anchor message first; keep the original question anchor.
+            drop_index = 2 if len(parts) > 2 and parts[1].startswith("[... omitted") else 1
+            parts.pop(drop_index)
+            formatted = "\n\n".join(parts)
+
+        return self._truncate_text(formatted, max_chars, "conversation history")
     
     def _setup_strands_environment(self):
         """Setup Strands environment and tools."""

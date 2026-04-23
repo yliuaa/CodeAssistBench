@@ -341,8 +341,4 @@ TOOL USAGE GUIDELINES:
         Returns:
             Formatted conversation string
         """
-        formatted = ""
-        for message in history:
-            role = "User" if message.role == "user" else "Maintainer"
-            formatted += f"{role}: {message.content}\n\n"
-        return formatted
+        return self._format_bounded_conversation_history(history)

@@ -1,8 +1,8 @@
 """LLM service for managing model interactions."""
 
+import asyncio
 import json
 import os
-import time
 import logging
 from typing import Optional, Dict, Any
 
@@ -46,6 +46,7 @@ class LLMService:
         
         # Initialize OpenAI client cache
         self._openai_clients: Dict[str, OpenAI] = {}
+        self._vllm_clients: Dict[str, OpenAI] = {}
     
     def _get_openai_client(self, api_key_env_var: str) -> OpenAI:
         """Get or create OpenAI client."""
@@ -55,6 +56,21 @@ class LLMService:
                 raise LLMError(f"Missing environment variable: {api_key_env_var}")
             self._openai_clients[api_key_env_var] = OpenAI(api_key=api_key)
         return self._openai_clients[api_key_env_var]
+
+    def _get_vllm_client(self, model_config: ModelConfig) -> OpenAI:
+        """Get or create OpenAI-compatible client for vLLM."""
+        base_url = model_config.base_url or os.getenv("VLLM_BASE_URL", "http://127.0.0.1:8000/v1")
+        if model_config.api_key_env_var:
+            api_key = os.getenv(model_config.api_key_env_var)
+            if not api_key:
+                raise LLMError(f"Missing environment variable: {model_config.api_key_env_var}")
+        else:
+            api_key = os.getenv("VLLM_API_KEY", "EMPTY")
+
+        client_key = f"{base_url}|{api_key}"
+        if client_key not in self._vllm_clients:
+            self._vllm_clients[client_key] = OpenAI(base_url=base_url, api_key=api_key)
+        return self._vllm_clients[client_key]
     
     def _is_input_too_long_error(self, error_message: str) -> bool:
         """Check if error indicates input too long."""
@@ -62,10 +78,71 @@ class LLMService:
         for pattern in ValidationPatterns.INPUT_TOO_LONG_PATTERNS:
             if pattern.lower() in error_text:
                 return True
+        vllm_context_markers = [
+            "maximum context length",
+            "please reduce the length of the input prompt",
+            "requested output tokens",
+            "parameter=input_text",
+        ]
+        if any(marker in error_text for marker in vllm_context_markers):
+            return True
         return False
+
+    def _is_retryable_error(self, error_message: str) -> bool:
+        """Check whether an error is transient and worth retrying."""
+        error_text = str(error_message).lower()
+        retryable_markers = [
+            "429",
+            "rate limit",
+            "timeout",
+            "timed out",
+            "connection error",
+            "connection reset",
+            "temporarily unavailable",
+            "service unavailable",
+            "bad gateway",
+            "gateway timeout",
+            "internal server error",
+            "error code: 500",
+            "error code: 502",
+            "error code: 503",
+            "error code: 504",
+        ]
+        return any(marker in error_text for marker in retryable_markers)
+
+    def _estimate_tokens_from_text(self, text: str) -> int:
+        """Rough token estimate used for preflight budgeting without tokenizer deps."""
+        # Conservative approximation: ~3 chars/token for mixed code + English.
+        return max(1, (len(text) + 2) // 3)
+
+    def _get_vllm_output_token_budget(
+        self,
+        user_prompt: str,
+        system_prompt: str,
+        model_config: ModelConfig,
+    ) -> int:
+        """Return fixed vLLM completion budget after context preflight."""
+        context_limit = model_config.max_tokens
+        prompt_tokens = self._estimate_tokens_from_text(user_prompt) + self._estimate_tokens_from_text(system_prompt)
+        safety_margin = int(os.getenv("VLLM_CONTEXT_SAFETY_MARGIN", "512"))
+        output_tokens = int(os.getenv("VLLM_MAX_OUTPUT_TOKENS", "2048"))
+
+        requested_tokens = prompt_tokens + output_tokens + safety_margin
+        if requested_tokens > context_limit:
+            raise InputTooLongError(
+                f"Prompt too large for fixed vLLM context budget (estimated prompt={prompt_tokens} tokens, "
+                f"reserved_output={output_tokens}, safety_margin={safety_margin}, context={context_limit})."
+            )
+
+        return output_tokens
     
     def _check_input_size(self, user_prompt: str, system_prompt: str, model_config: ModelConfig):
         """Check if input size exceeds model limits."""
+        if model_config.provider == "vllm":
+            # vLLM uses max_tokens as completion budget; validate against context via token estimate.
+            _ = self._get_vllm_output_token_budget(user_prompt, system_prompt, model_config)
+            return
+
         total_prompt_size = len(user_prompt) + len(system_prompt)
         if total_prompt_size > model_config.max_tokens:
             raise InputTooLongError(
@@ -102,17 +179,27 @@ class LLMService:
         # Check input size
         self._check_input_size(user_prompt, system_prompt, model_config)
         
+        provider = model_config.provider
+        effective_max_retries = max_retries
+        if provider == "vllm":
+            effective_max_retries = min(max_retries, int(os.getenv("VLLM_MAX_RETRIES", "3")))
+
         retry_count = 0
-        while retry_count <= max_retries:
+        while retry_count <= effective_max_retries:
             try:
-                if model_config.provider == "openai":
+                if provider == "openai":
                     return await self._call_openai_model(
                         user_prompt, system_prompt, model_config
                     )
-                else:  # bedrock
+                if provider == "vllm":
+                    return await self._call_vllm_model(
+                        user_prompt, system_prompt, model_config
+                    )
+                if provider == "bedrock":
                     return await self._call_bedrock_model(
                         user_prompt, system_prompt, model_config
                     )
+                raise LLMError(f"Unsupported model provider: {provider}")
                     
             except Exception as e:
                 error_str = str(e)
@@ -121,19 +208,27 @@ class LLMService:
                 if self._is_input_too_long_error(error_str):
                     logger.warning(f"Input size error: {error_str}")
                     raise InputTooLongError(error_str)
+
+                # Non-transient errors should fail fast.
+                if not self._is_retryable_error(error_str):
+                    raise LLMError(
+                        f"Non-retryable error while calling {model_config.name}: {error_str}",
+                        model_name=model_config.name,
+                        retry_count=retry_count
+                    )
                 
                 retry_count += 1
-                if retry_count <= max_retries:
-                    wait_time = 10
+                if retry_count <= effective_max_retries:
+                    wait_time = 0.0 if provider == "vllm" else 10.0
                     logger.warning(
-                        f"LLM call failed (attempt {retry_count}/{max_retries}). "
+                        f"LLM call failed (attempt {retry_count}/{effective_max_retries}). "
                         f"Retrying in {wait_time:.2f} seconds. Error: {error_str}"
                     )
-                    time.sleep(wait_time)
+                    await asyncio.sleep(wait_time)
                 else:
-                    logger.error(f"LLM call failed after {max_retries} retries: {error_str}")
+                    logger.error(f"LLM call failed after {effective_max_retries} retries: {error_str}")
                     raise LLMError(
-                        f"Failed to call {model_config.name} after {max_retries} retries: {error_str}",
+                        f"Failed to call {model_config.name} after {effective_max_retries} retries: {error_str}",
                         model_name=model_config.name,
                         retry_count=retry_count
                     )
@@ -159,6 +254,30 @@ class LLMService:
             temperature=model_config.temperature,
         )
         
+        return response.choices[0].message.content
+
+    async def _call_vllm_model(
+        self,
+        user_prompt: str,
+        system_prompt: str,
+        model_config: ModelConfig
+    ) -> str:
+        """Call vLLM model through OpenAI-compatible API."""
+        client = self._get_vllm_client(model_config)
+        max_output_tokens = self._get_vllm_output_token_budget(user_prompt, system_prompt, model_config)
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        response = client.chat.completions.create(
+            model=model_config.model_id,
+            messages=messages,
+            max_tokens=max_output_tokens,
+            temperature=model_config.temperature,
+        )
+
         return response.choices[0].message.content
     
     async def _call_bedrock_model(

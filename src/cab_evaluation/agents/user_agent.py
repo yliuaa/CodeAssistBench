@@ -1,6 +1,7 @@
 """User agent implementation."""
 
 import json
+import os
 import re
 from typing import Dict, List, Optional, Any
 
@@ -147,11 +148,16 @@ class UserAgent(StrandsAgent):
         
         # Create formatted conversation history string
         formatted_conversation = self._format_conversation_history(conversation_history)
+        original_question = self._truncate_text(
+            issue_data.first_question.body,
+            int(os.getenv("CAB_ORIGINAL_QUESTION_CHARS", "5000")),
+            "original question",
+        )
         
         # Create user prompt
         user_prompt = f"""
         Here is your original question:
-        {issue_data.first_question.body}
+        {original_question}
         
         Here is your conversation with the maintainer so far:
         {formatted_conversation}
@@ -228,8 +234,4 @@ class UserAgent(StrandsAgent):
         Returns:
             Formatted conversation string
         """
-        formatted = ""
-        for i, message in enumerate(history):
-            role = "User" if message.role == "user" else "Maintainer"
-            formatted += f"{role}: {message.content}\n\n"
-        return formatted
+        return self._format_bounded_conversation_history(history)

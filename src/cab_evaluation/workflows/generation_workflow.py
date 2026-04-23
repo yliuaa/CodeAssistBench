@@ -1,5 +1,6 @@
 """Generation workflow for CAB evaluation."""
 
+import os
 import time
 import logging
 from typing import Optional, Dict, Any, List, Tuple
@@ -47,6 +48,26 @@ class GenerationWorkflow:
                     handler.flush()
         except Exception as e:
             logger.error(f"Error flushing logger: {e}")
+
+    def _truncate_text(self, text: str, max_chars: int, label: str) -> str:
+        """Deterministically truncate text for bounded prompts."""
+        if not text or len(text) <= max_chars:
+            return text
+        omitted = len(text) - max_chars
+        head_chars = max_chars // 3
+        tail_chars = max_chars - head_chars
+        return (
+            f"{text[:head_chars]}\n"
+            f"[... omitted {omitted} chars from {label} ...]\n"
+            f"{text[-tail_chars:]}"
+        )
+
+    def _append_bounded_context(self, current_context: str, addition: str, max_chars: int) -> str:
+        """Append exploration context while preserving the most recent evidence."""
+        combined = current_context + addition
+        if len(combined) <= max_chars:
+            return combined
+        return "[... earlier exploration context omitted ...]\n" + combined[-max_chars:]
         
     async def run_generation(
         self,
@@ -455,8 +476,8 @@ class GenerationWorkflow:
         exploration_history = []
         exploration_log = ""
         
-        # Estimate context size limits (150K tokens ~= 600K chars)
-        max_context_size = 600000
+        max_context_size = int(os.getenv("CAB_EXPLORATION_CONTEXT_CHARS", "12000"))
+        max_command_result_chars = int(os.getenv("CAB_EXPLORATION_COMMAND_CHARS", "3000"))
         current_exploration_context = ""
         
         # Detect if using Kiro CLI
@@ -548,6 +569,7 @@ class GenerationWorkflow:
                     try:
                         log.info(f"Executing command {i+1}/{len(commands)}: {cmd}")
                         result = execute_command(repo_dir, cmd, timeout=self.config.workflow.command_timeout)
+                        result = self._truncate_text(result, max_command_result_chars, f"command output: {cmd}")
                         iteration_results += f"Command: {cmd}\nResult:\n{result}\n\n"
                     except Exception as e:
                         error_msg = f"Error executing command: {cmd}\nError: {str(e)}\n\n"
@@ -557,15 +579,12 @@ class GenerationWorkflow:
             # Add iteration results to full log
             exploration_log += f"\n--- ITERATION {iteration+1} ---\n{iteration_results}"
             
-            # Check context size before adding to current context
-            new_context = current_exploration_context + f"\n--- ITERATION {iteration+1} ---\n{iteration_results}"
-            
-            if len(new_context) > max_context_size:
-                log.warning(f"Exploration context would exceed size limit. Stopping exploration.")
-                exploration_log += "\n--- EXPLORATION STOPPED: Context size limit ---\n"
-                break
-            else:
-                current_exploration_context = new_context
+            context_addition = f"\n--- ITERATION {iteration+1} ---\n{iteration_results}"
+            current_exploration_context = self._append_bounded_context(
+                current_exploration_context,
+                context_addition,
+                max_context_size,
+            )
             
             # Check for answer
             if "ANSWER:" in exploration_plan:
