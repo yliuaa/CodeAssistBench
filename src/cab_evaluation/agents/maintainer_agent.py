@@ -57,8 +57,12 @@ class MaintainerAgent(StrandsAgent):
         docker_guidance = ""
         if kwargs.get('is_docker_issue'):
             docker_guidance = self.prompt_manager.get_prompt("maintainer/docker_prompt")
-        
-        return f"{base_prompt}{repo_context}{docker_guidance}"
+
+        evolution_context = ""
+        if kwargs.get("evolution_context"):
+            evolution_context = f"\n\n{kwargs['evolution_context']}"
+
+        return f"{base_prompt}{repo_context}{docker_guidance}{evolution_context}"
     
     async def generate_response(
         self,
@@ -128,7 +132,8 @@ TOOL USAGE GUIDELINES:
         docker_system_prompt = self.get_system_prompt(
             is_docker_issue=True,
             repo_url=issue_data.commit_info.repository,
-            commit_hash=issue_data.commit_info.sha
+            commit_hash=issue_data.commit_info.sha,
+            evolution_context=kwargs.get("evolution_context"),
         ) + TaskPrompts.DOCKER_EXPLORATION
         
         # Create user prompt
@@ -215,7 +220,8 @@ TOOL USAGE GUIDELINES:
         # Create system prompt
         system_prompt = self.get_system_prompt(
             repo_url=issue_data.commit_info.repository,
-            commit_hash=issue_data.commit_info.sha
+            commit_hash=issue_data.commit_info.sha,
+            evolution_context=kwargs.get("evolution_context"),
         ) + """
         You are in a conversation with a user who is asking questions about a code issue.
         Respond to their latest message, using your repository knowledge to provide accurate information.

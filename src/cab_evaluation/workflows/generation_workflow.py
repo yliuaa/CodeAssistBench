@@ -1,6 +1,7 @@
 """Generation workflow for CAB evaluation."""
 
 import os
+import re
 import time
 import logging
 from typing import Optional, Dict, Any, List, Tuple
@@ -24,6 +25,12 @@ logger = logging.getLogger(__name__)
 
 class GenerationWorkflow:
     """Handles the generation workflow - conversation between maintainer and user agents."""
+    
+    _SHELL_PREFIXES = (
+        "rg ", "rg --", "grep ", "find ", "ls", "cat ", "sed ", "head ", "tail ",
+        "pwd", "git ", "python ", "python3 ", "pytest", "test ", "wc ", "awk ",
+        "tree", "fd ", "stat ", "cut ", "sort ", "uniq ", "xargs "
+    )
     
     def __init__(self, config: Optional[CABConfig] = None):
         """Initialize generation workflow.
@@ -68,6 +75,80 @@ class GenerationWorkflow:
         if len(combined) <= max_chars:
             return combined
         return "[... earlier exploration context omitted ...]\n" + combined[-max_chars:]
+
+    def _extract_explicit_explore_commands(self, exploration_plan: str) -> List[str]:
+        """Extract commands from explicit EXPLORE: lines."""
+        commands: List[str] = []
+        for line in exploration_plan.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("EXPLORE:"):
+                command = stripped.split("EXPLORE:", 1)[1].strip()
+                if command:
+                    commands.append(command)
+        return commands
+
+    def _normalize_command_candidate(self, line: str) -> str:
+        """Normalize a line before checking whether it looks like a shell command."""
+        stripped = line.strip()
+        stripped = re.sub(r"^[-*]\s+", "", stripped)
+        stripped = re.sub(r"^\d+[.)]\s+", "", stripped)
+        return stripped.strip("`")
+
+    def _looks_like_exploration_command(self, line: str) -> bool:
+        """Return whether a normalized line looks like a shell command."""
+        return bool(line) and line.startswith(self._SHELL_PREFIXES)
+
+    def _dedupe_commands(self, commands: List[str]) -> List[str]:
+        """Preserve order while removing duplicate commands."""
+        deduped_commands: List[str] = []
+        seen = set()
+        for command in commands:
+            if command not in seen:
+                seen.add(command)
+                deduped_commands.append(command)
+        return deduped_commands
+
+    def _extract_fallback_exploration_commands(self, exploration_plan: str) -> List[str]:
+        """Extract likely shell commands from code blocks or plain text lines."""
+        commands: List[str] = []
+
+        code_blocks = re.findall(r"```(?:bash|sh|shell)?\n(.*?)```", exploration_plan, flags=re.DOTALL)
+        for block in code_blocks:
+            for line in block.splitlines():
+                candidate = self._normalize_command_candidate(line)
+                if candidate and not candidate.startswith("#") and self._looks_like_exploration_command(candidate):
+                    commands.append(candidate)
+
+        if commands:
+            return self._dedupe_commands(commands)
+
+        for line in exploration_plan.splitlines():
+            candidate = self._normalize_command_candidate(line)
+            if self._looks_like_exploration_command(candidate):
+                commands.append(candidate)
+
+        return self._dedupe_commands(commands)
+
+    def _extract_exploration_commands(self, exploration_plan: str) -> Tuple[List[str], bool]:
+        """Extract exploration commands, preferring explicit EXPLORE: lines."""
+        explicit_commands = self._extract_explicit_explore_commands(exploration_plan)
+        if explicit_commands:
+            return explicit_commands, False
+
+        fallback_commands = self._extract_fallback_exploration_commands(exploration_plan)
+        return fallback_commands, bool(fallback_commands)
+
+    def _summarize_unparsed_exploration_plan(self, exploration_plan: str, max_chars: int = 1200) -> str:
+        """Keep a short record when exploration text could not be parsed into commands."""
+        cleaned = exploration_plan.strip()
+        if not cleaned:
+            return ""
+        excerpt = self._truncate_text(cleaned, max_chars, "unparsed exploration plan")
+        return (
+            "[No executable exploration commands were parsed from this exploration response. "
+            "Keeping the raw plan excerpt for context.]\n"
+            f"{excerpt}\n"
+        )
         
     async def run_generation(
         self,
@@ -75,7 +156,8 @@ class GenerationWorkflow:
         agent_model_mapping: Optional[Dict[str, str]] = None,
         agent_framework_mapping: Optional[Dict[str, str]] = None,
         issue_logger: Optional[logging.Logger] = None,
-        enable_ast_tools: bool = True
+        enable_ast_tools: bool = True,
+        maintainer_evolution_context: Optional[str] = None,
     ) -> GenerationResult:
         """Run generation workflow for an issue.
         
@@ -144,20 +226,20 @@ class GenerationWorkflow:
                 log.info("Using OpenHands native agentic loop")
                 self._flush_logger(log)
                 initial_answer, exploration_history, exploration_log = await self._openhands_exploration(
-                    repo_dir, question, maintainer_agent, issue_data.id, issue_logger
+                    repo_dir, question, maintainer_agent, issue_data.id, issue_logger, maintainer_evolution_context
                 )
             elif is_kiro_cli:
                 log.info("Using Kiro CLI native agentic loop (single call)")
                 self._flush_logger(log)
                 initial_answer, exploration_history, exploration_log = await self._kiro_cli_exploration(
-                    repo_dir, question, maintainer_agent, issue_data.id, issue_logger
+                    repo_dir, question, maintainer_agent, issue_data.id, issue_logger, maintainer_evolution_context
                 )
             else:
                 # Perform interactive exploration for Strands agents (which need manual iteration)
                 log.info("Starting interactive exploration (Strands agent)")
                 self._flush_logger(log)
                 initial_answer, exploration_history, exploration_log = await self._interactive_exploration(
-                    repo_dir, question, maintainer_agent, issue_data.id, issue_logger
+                    repo_dir, question, maintainer_agent, issue_data.id, issue_logger, maintainer_evolution_context
                 )
             
             log.info(f"Exploration complete. Initial answer length: {len(initial_answer)}")
@@ -189,7 +271,15 @@ class GenerationWorkflow:
             log.info("Starting agent conversation")
             self._flush_logger(log)
             final_conversation, total_rounds, final_satisfaction = await self._conduct_conversation(
-                repo_dir, issue_data, conversation_history, maintainer_agent, user_agent, docker_results, exploration_log, issue_logger
+                repo_dir,
+                issue_data,
+                conversation_history,
+                maintainer_agent,
+                user_agent,
+                docker_results,
+                exploration_log,
+                issue_logger,
+                maintainer_evolution_context,
             )
             
             # Get final LLM call statistics
@@ -359,7 +449,8 @@ class GenerationWorkflow:
         question: str,
         maintainer_agent,
         issue_id: str,
-        issue_logger: Optional[logging.Logger] = None
+        issue_logger: Optional[logging.Logger] = None,
+        evolution_context: Optional[str] = None,
     ) -> Tuple[str, List[str], str]:
         """Let OpenHands handle exploration with its native agentic loop.
         
@@ -375,7 +466,7 @@ class GenerationWorkflow:
         """
         log = issue_logger or logger
         
-        system_prompt = maintainer_agent.get_system_prompt()
+        system_prompt = maintainer_agent.get_system_prompt(evolution_context=evolution_context)
         user_prompt = f"Question: {question}\n\nPlease explore the repository and provide a comprehensive answer."
         
         try:
@@ -399,7 +490,8 @@ class GenerationWorkflow:
         question: str,
         maintainer_agent,
         issue_id: str,
-        issue_logger: Optional[logging.Logger] = None
+        issue_logger: Optional[logging.Logger] = None,
+        evolution_context: Optional[str] = None,
     ) -> Tuple[str, List[str], str]:
         """Let Kiro CLI handle exploration with its native agentic loop.
         
@@ -418,7 +510,7 @@ class GenerationWorkflow:
         """
         log = issue_logger or logger
         
-        system_prompt = maintainer_agent.get_system_prompt() + TaskPrompts.INITIAL_EXPLORATION
+        system_prompt = maintainer_agent.get_system_prompt(evolution_context=evolution_context) + TaskPrompts.INITIAL_EXPLORATION
         user_prompt = f"Question: {question}\n\nPlease explore the repository and provide a comprehensive answer to help the user understand this code issue."
         
         log.info("Kiro CLI will handle all exploration internally with its native tools")
@@ -455,6 +547,7 @@ class GenerationWorkflow:
         maintainer_agent,
         issue_id: str,
         issue_logger: Optional[logging.Logger] = None,
+        evolution_context: Optional[str] = None,
         max_iterations: int = 5
     ) -> Tuple[str, List[str], str]:
         """Perform interactive repository exploration.
@@ -493,18 +586,18 @@ class GenerationWorkflow:
             if is_kiro_cli:
                 # Kiro CLI uses its own tools, so we add summary instructions
                 if iteration == 0:
-                    system_prompt = maintainer_agent.get_system_prompt() + TaskPrompts.INITIAL_EXPLORATION + TaskPrompts.KIRO_CLI_EXPLORATION
+                    system_prompt = maintainer_agent.get_system_prompt(evolution_context=evolution_context) + TaskPrompts.INITIAL_EXPLORATION + TaskPrompts.KIRO_CLI_EXPLORATION
                     user_prompt = f"Question: {question}\n\nPlease help me understand this code issue."
                 else:
-                    system_prompt = maintainer_agent.get_system_prompt() + TaskPrompts.KIRO_CLI_CONTINUED_EXPLORATION
+                    system_prompt = maintainer_agent.get_system_prompt(evolution_context=evolution_context) + TaskPrompts.KIRO_CLI_CONTINUED_EXPLORATION
                     user_prompt = f"Question: {question}\n\nPrevious exploration summary:\n{current_exploration_context}\n\nPlease continue exploring or provide an answer."
             else:
                 # Standard exploration with EXPLORE: commands
                 if iteration == 0:
-                    system_prompt = maintainer_agent.get_system_prompt() + TaskPrompts.INITIAL_EXPLORATION
+                    system_prompt = maintainer_agent.get_system_prompt(evolution_context=evolution_context) + TaskPrompts.INITIAL_EXPLORATION
                     user_prompt = f"Question: {question}\n\nPlease help me understand this code issue."
                 else:
-                    system_prompt = maintainer_agent.get_system_prompt() + TaskPrompts.CONTINUED_EXPLORATION
+                    system_prompt = maintainer_agent.get_system_prompt(evolution_context=evolution_context) + TaskPrompts.CONTINUED_EXPLORATION
                     user_prompt = f"Question: {question}\n\nExploration results so far:\n{current_exploration_context}\n\nPlease continue exploring or provide an answer."
             
             # Get exploration plan from maintainer
@@ -555,26 +648,31 @@ class GenerationWorkflow:
                     # (first 2000 chars to avoid context bloat)
                     iteration_results = f"[Kiro CLI Response Summary]\n{exploration_plan[:2000]}{'...' if len(exploration_plan) > 2000 else ''}"
                 log.info(f"Extracted Kiro CLI summary ({len(iteration_results)} chars)")
-            elif "EXPLORE:" in exploration_plan:
-                commands = [
-                    line.split("EXPLORE: ", 1)[1].strip() 
-                    for line in exploration_plan.split('\n') 
-                    if line.strip().startswith("EXPLORE:")
-                ]
+            else:
+                commands, used_fallback_parser = self._extract_exploration_commands(exploration_plan)
                 
-                log.info(f"Executing {len(commands)} exploration commands")
-                self._flush_logger(log)
-                
-                for i, cmd in enumerate(commands):
-                    try:
-                        log.info(f"Executing command {i+1}/{len(commands)}: {cmd}")
-                        result = execute_command(repo_dir, cmd, timeout=self.config.workflow.command_timeout)
-                        result = self._truncate_text(result, max_command_result_chars, f"command output: {cmd}")
-                        iteration_results += f"Command: {cmd}\nResult:\n{result}\n\n"
-                    except Exception as e:
-                        error_msg = f"Error executing command: {cmd}\nError: {str(e)}\n\n"
-                        log.error(f"Command execution error: {str(e)}")
-                        iteration_results += error_msg
+                if commands:
+                    if used_fallback_parser:
+                        log.info(
+                            "Parsed %s exploration command(s) without explicit EXPLORE: prefix",
+                            len(commands),
+                        )
+                    else:
+                        log.info(f"Executing {len(commands)} exploration commands")
+                    self._flush_logger(log)
+                    
+                    for i, cmd in enumerate(commands):
+                        try:
+                            log.info(f"Executing command {i+1}/{len(commands)}: {cmd}")
+                            result = execute_command(repo_dir, cmd, timeout=self.config.workflow.command_timeout)
+                            result = self._truncate_text(result, max_command_result_chars, f"command output: {cmd}")
+                            iteration_results += f"Command: {cmd}\nResult:\n{result}\n\n"
+                        except Exception as e:
+                            error_msg = f"Error executing command: {cmd}\nError: {str(e)}\n\n"
+                            log.error(f"Command execution error: {str(e)}")
+                            iteration_results += error_msg
+                else:
+                    iteration_results = self._summarize_unparsed_exploration_plan(exploration_plan)
             
             # Add iteration results to full log
             exploration_log += f"\n--- ITERATION {iteration+1} ---\n{iteration_results}"
@@ -596,7 +694,7 @@ class GenerationWorkflow:
         # Generate final answer if no explicit answer found
         log.info("Generating final answer from exploration results")
         self._flush_logger(log)
-        final_system_prompt = maintainer_agent.get_system_prompt() + TaskPrompts.FINAL_ANSWER_GENERATION
+        final_system_prompt = maintainer_agent.get_system_prompt(evolution_context=evolution_context) + TaskPrompts.FINAL_ANSWER_GENERATION
         final_user_prompt = f"""
         Question: {question}
         
@@ -645,7 +743,8 @@ class GenerationWorkflow:
         user_agent,
         initial_docker_results: Optional[Dict[str, Any]] = None,
         exploration_log: str = "",
-        issue_logger: Optional[logging.Logger] = None
+        issue_logger: Optional[logging.Logger] = None,
+        evolution_context: Optional[str] = None,
     ) -> Tuple[List[ConversationMessage], int, Dict[str, Any]]:
         """Conduct conversation between user and maintainer agents.
         
@@ -733,7 +832,11 @@ class GenerationWorkflow:
                     # Docker-aware response
                     log.info("Using Docker-aware maintainer response")
                     maintainer_response, extra_files, modified_dockerfile = await maintainer_agent.generate_docker_response(
-                        repo_dir, issue_data, conversation_history, issue_logger=log
+                        repo_dir,
+                        issue_data,
+                        conversation_history,
+                        issue_logger=log,
+                        evolution_context=evolution_context,
                     )
                     
                     # Check for context length exceeded error
@@ -767,7 +870,11 @@ class GenerationWorkflow:
                 else:
                     # Standard response with exploration
                     maintainer_response, exploration_results = await maintainer_agent.generate_standard_response(
-                        repo_dir, issue_data, conversation_history, issue_logger=log
+                        repo_dir,
+                        issue_data,
+                        conversation_history,
+                        issue_logger=log,
+                        evolution_context=evolution_context,
                     )
                     
                     # Check for context length exceeded error

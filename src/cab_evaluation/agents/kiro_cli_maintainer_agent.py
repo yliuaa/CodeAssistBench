@@ -157,8 +157,12 @@ KIRO CLI CONTEXT:
 - Focus on providing accurate, executable solutions
 - Provide clear explanations with code examples when applicable
 """
-        
-        return f"{base_prompt}{repo_context}{kiro_cli_guidance}"
+
+        evolution_context = ""
+        if kwargs.get("evolution_context"):
+            evolution_context = f"\n\n{kwargs['evolution_context']}"
+
+        return f"{base_prompt}{repo_context}{kiro_cli_guidance}{evolution_context}"
     
     async def call_llm(
         self,

@@ -326,6 +326,59 @@ async def run_generation_dataset(args):
         return 1
 
 
+async def run_reflexion_dataset(args):
+    """Run online Reflexion evolution on a JSONL dataset."""
+    logger = logging.getLogger(__name__)
+
+    config = CABConfig.from_file(args.config) if args.config else CABConfig()
+
+    if hasattr(args, "openhands_config") and args.openhands_config:
+        config.agent_framework.openhands_config_path = args.openhands_config
+
+    if hasattr(args, "max_conversation_rounds") and args.max_conversation_rounds is not None:
+        config.workflow.max_conversation_rounds = args.max_conversation_rounds
+        logger.info(f"Setting max_conversation_rounds to {args.max_conversation_rounds} from CLI argument")
+
+    agent_model_mapping = None
+    if args.agent_models:
+        try:
+            agent_model_mapping = json.loads(args.agent_models)
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON in agent_models: {e}")
+            return 1
+
+    agent_framework_mapping = None
+    if hasattr(args, "agent_framework") and args.agent_framework:
+        try:
+            agent_framework_mapping = json.loads(args.agent_framework)
+            logger.info(f"Using agent frameworks: {agent_framework_mapping}")
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON in agent_framework: {e}")
+            return 1
+
+    checkpoint_steps = [int(step.strip()) for step in args.checkpoint_steps.split(",") if step.strip()]
+
+    try:
+        from .workflows.reflexion_workflow import ReflexionWorkflow
+
+        workflow = ReflexionWorkflow(config)
+        summary = await workflow.run_dataset(
+            dataset_file=args.dataset_file,
+            output_dir=args.output_dir,
+            agent_model_mapping=agent_model_mapping,
+            agent_framework_mapping=agent_framework_mapping,
+            language=args.language,
+            checkpoint_steps=checkpoint_steps,
+            max_prompt_chars=args.reflexion_memory_chars,
+            enable_ast_tools=not getattr(args, "disable_ast_tools", False),
+        )
+        logger.info(f"Reflexion run complete: {summary}")
+        return 0
+    except Exception as e:
+        logger.error(f"Reflexion dataset processing failed: {e}")
+        return 1
+
+
 async def run_evaluation_dataset(args):
     """Run evaluation workflow on JSONL generation results."""
     logger = logging.getLogger(__name__)
@@ -782,6 +835,57 @@ def main():
         action="store_true",
         help="Disable AST tools (read_code, edit_code) for OpenHands maintainer agent"
     )
+
+    reflexion_dataset_parser = subparsers.add_parser(
+        "reflexion-dataset",
+        help="Run online Reflexion evolution on a JSONL dataset",
+    )
+    reflexion_dataset_parser.add_argument(
+        "dataset_file",
+        help="JSONL file containing multiple issues"
+    )
+    reflexion_dataset_parser.add_argument(
+        "--output-dir", "-o",
+        required=True,
+        help="Output directory for Reflexion run artifacts"
+    )
+    reflexion_dataset_parser.add_argument(
+        "--language", "-l",
+        help="Filter by programming language"
+    )
+    reflexion_dataset_parser.add_argument(
+        "--agent-models",
+        help='JSON mapping of agents to models (e.g., \'{"maintainer":"qwen3coder_vllm","user":"qwen3coder_vllm"}\')'
+    )
+    reflexion_dataset_parser.add_argument(
+        "--agent-framework",
+        help='JSON mapping of agents to frameworks (e.g., \'{"maintainer": "openhands"}\')'
+    )
+    reflexion_dataset_parser.add_argument(
+        "--openhands-config",
+        help="Path to OpenHands config.toml file (only used if maintainer uses OpenHands framework)"
+    )
+    reflexion_dataset_parser.add_argument(
+        "--max-conversation-rounds",
+        type=int,
+        help="Maximum conversation rounds between maintainer and user agents"
+    )
+    reflexion_dataset_parser.add_argument(
+        "--disable-ast-tools",
+        action="store_true",
+        help="Disable AST tools (read_code, edit_code) for OpenHands maintainer agent"
+    )
+    reflexion_dataset_parser.add_argument(
+        "--checkpoint-steps",
+        default="0,5,10,20,50",
+        help="Comma-separated evolution steps to checkpoint"
+    )
+    reflexion_dataset_parser.add_argument(
+        "--reflexion-memory-chars",
+        type=int,
+        default=None,
+        help="Maximum prompt chars for injected reflection memory"
+    )
     
     # Evaluation dataset command for JSONL files with generation results
     evaluation_dataset_parser = subparsers.add_parser("evaluation-dataset", help="Run evaluation workflow on JSONL generation results")
@@ -825,6 +929,8 @@ def main():
         return asyncio.run(run_dataset(args))
     elif args.command == "generation-dataset":
         return asyncio.run(run_generation_dataset(args))
+    elif args.command == "reflexion-dataset":
+        return asyncio.run(run_reflexion_dataset(args))
     elif args.command == "evaluation-dataset":
         return asyncio.run(run_evaluation_dataset(args))
     elif args.command == "config":

@@ -186,6 +186,13 @@ class CABConfig:
                 provider="vllm",
                 base_url="http://127.0.0.1:8001/v1"
             ),
+            "qwen3_8b_vllm": ModelConfig(
+                name="qwen3_8b_vllm",
+                model_id="Qwen/Qwen3-8B",
+                max_tokens=12000,
+                provider="vllm",
+                base_url="http://127.0.0.1:8001/v1"
+            ),
             "qwen3coder_vllm": ModelConfig(
                 name="qwen3coder_vllm",
                 model_id="Qwen/Qwen3-Coder-30B-A3B-Instruct",

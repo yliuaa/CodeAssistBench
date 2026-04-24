@@ -26,7 +26,8 @@ setup(
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
     packages=["cab_evaluation", "cab_evaluation.core", "cab_evaluation.agents", 
-              "cab_evaluation.workflows", "cab_evaluation.utils", "cab_evaluation.prompts"],
+              "cab_evaluation.workflows", "cab_evaluation.utils", "cab_evaluation.prompts",
+              "cab_evaluation.evolution"],
     package_dir={"": "src"},
     install_requires=[
         "boto3>=1.34.0",

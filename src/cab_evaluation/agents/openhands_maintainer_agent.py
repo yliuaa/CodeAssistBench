@@ -189,8 +189,12 @@ class OpenHandsMaintainerAgent(BaseAgent):
             repo_context += f"\nRepository: {kwargs['repo_url']}"
         if 'commit_hash' in kwargs:
             repo_context += f"\nCommit hash: {kwargs['commit_hash']}"
-        
-        return f"{base_prompt}{repo_context}"
+
+        evolution_context = ""
+        if kwargs.get("evolution_context"):
+            evolution_context = f"\n\n{kwargs['evolution_context']}"
+
+        return f"{base_prompt}{repo_context}{evolution_context}"
     
     async def call_llm(
         self,

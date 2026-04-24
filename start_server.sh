@@ -2,6 +2,7 @@
 set -euo pipefail
 
 MODEL_ID="${MODEL_ID:-Qwen/Qwen3-Coder-30B-A3B-Instruct}"
+TOOL_PARSER="${TOOL_PARSER:-hermes}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8000}"
 TP_SIZE="${TP_SIZE:-1}"
@@ -19,7 +20,7 @@ vllm serve "${MODEL_ID}" \
     --dtype bfloat16 \
     --tensor-parallel-size "${TP_SIZE}" \
     --gpu-memory-utilization 0.98 \
-    --max-model-len 12000 \
+    --max-model-len 20000 \
     --max-num-seqs 1 \
     --enable-auto-tool-choice \
-    --tool-call-parser qwen3_coder \
+    --tool-call-parser "${TOOL_PARSER}" \
